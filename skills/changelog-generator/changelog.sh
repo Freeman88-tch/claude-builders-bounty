@@ -5,10 +5,9 @@
 set -euo pipefail
 
 # Defaults
-SINCE="${2:-$(git describe --tags --abbrev=0 2>/dev/null || echo 'HEAD~50')}"
-REPO_DIR="${4:-.}"
+SINCE=""
+REPO_DIR="."
 OUTPUT="CHANGELOG.md"
-VERBOSE=false
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -16,7 +15,6 @@ while [[ $# -gt 0 ]]; do
     --since) SINCE="$2"; shift 2 ;;
     --repo)  REPO_DIR="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
-    --verbose) VERBOSE=true; shift ;;
     *) shift ;;
   esac
 done
@@ -29,17 +27,28 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
   exit 1
 fi
 
+# Determine since point
+if [ -z "$SINCE" ]; then
+  LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+  if [ -n "$LAST_TAG" ]; then
+    SINCE="$LAST_TAG"
+  else
+    SINCE="HEAD~50"
+  fi
+fi
+
 echo "🔍 Generating changelog since: $SINCE"
 
-# Get the last release tag for version header
-LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-COMMITS=$(git log "$SINCE"..HEAD --format="%H||%s||%an||%ad" --date=short 2>/dev/null)
+# Get commits as tab-separated values
+COMMITS=$(git log "$SINCE"..HEAD --format="%H%x09%s%x09%an%x09%ad" --date=short 2>/dev/null || true)
 
 if [ -z "$COMMITS" ]; then
   echo "⚠️  No commits found since $SINCE"
-  echo "# Changelog" > "$OUTPUT"
-  echo "" >> "$OUTPUT"
-  echo "No changes since $SINCE." >> "$OUTPUT"
+  {
+    echo "# Changelog"
+    echo ""
+    echo "No changes since $SINCE."
+  } > "$OUTPUT"
   echo "✅ $OUTPUT generated (empty)"
   exit 0
 fi
@@ -51,37 +60,40 @@ CHANGED=()
 REMOVED=()
 OTHER=()
 
-while IFS='||' read -r HASH MESSAGE AUTHOR DATE; do
-  # Normalize message to lowercase for pattern matching
-  LC_MSG=$(echo "$MESSAGE" | tr '[:upper:]' '[:lower:]')
+while IFS=$'\t' read -r HASH MESSAGE AUTHOR DATE; do
+  [ -z "$HASH" ] && continue
   
-  if echo "$LC_MSG" | grep -qE '^(feat|add|feature|implement|introduce|new)'; then
-    ADDED+=("$HASH|$MESSAGE|$AUTHOR|$DATE")
-  elif echo "$LC_MSG" | grep -qE '^(fix|bug|hotfix|patch|correct|resolve)'; then
-    FIXED+=("$HASH|$MESSAGE|$AUTHOR|$DATE")
-  elif echo "$LC_MSG" | grep -qE '^(chore|refactor|update|upgrade|bump|improve|optimize)'; then
-    CHANGED+=("$HASH|$MESSAGE|$AUTHOR|$DATE")
-  elif echo "$LC_MSG" | grep -qE '^(remove|delete|deprecate|drop|clean)'; then
-    REMOVED+=("$HASH|$MESSAGE|$AUTHOR|$DATE")
-  else
-    OTHER+=("$HASH|$MESSAGE|$AUTHOR|$DATE")
-  fi
+  # Extract first word of commit message (lowercase)
+  FIRST_WORD=$(echo "$MESSAGE" | sed 's/[^a-zA-Z].*$//' | tr '[:upper:]' '[:lower:]')
+  
+  case "$FIRST_WORD" in
+    feat|add|feature|implement|introduce|new)
+      ADDED+=("$MESSAGE|$AUTHOR|$DATE") ;;
+    fix|bug|hotfix|patch|correct|resolve)
+      FIXED+=("$MESSAGE|$AUTHOR|$DATE") ;;
+    chore|refactor|update|upgrade|bump|improve|optimize)
+      CHANGED+=("$MESSAGE|$AUTHOR|$DATE") ;;
+    remove|delete|deprecate|drop|clean)
+      REMOVED+=("$MESSAGE|$AUTHOR|$DATE") ;;
+    *)
+      OTHER+=("$MESSAGE|$AUTHOR|$DATE") ;;
+  esac
 done <<< "$COMMITS"
-
-# Get current date
-RELEASE_DATE=$(date +%Y-%m-%d)
 
 # Generate CHANGELOG.md
 {
   echo "# Changelog"
   echo ""
+
+  LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+  RELEASE_DATE=$(date +%Y-%m-%d)
   echo "## [$LAST_TAG] - $RELEASE_DATE"
   echo ""
 
   if [ ${#ADDED[@]} -gt 0 ]; then
     echo "### Added"
     for entry in "${ADDED[@]}"; do
-      IFS='|' read -r HASH MSG AUTHOR DATE <<< "$entry"
+      IFS='|' read -r MSG AUTHOR DATE <<< "$entry"
       echo "- **$AUTHOR**: $MSG"
     done
     echo ""
@@ -90,7 +102,7 @@ RELEASE_DATE=$(date +%Y-%m-%d)
   if [ ${#FIXED[@]} -gt 0 ]; then
     echo "### Fixed"
     for entry in "${FIXED[@]}"; do
-      IFS='|' read -r HASH MSG AUTHOR DATE <<< "$entry"
+      IFS='|' read -r MSG AUTHOR DATE <<< "$entry"
       echo "- **$AUTHOR**: $MSG"
     done
     echo ""
@@ -99,7 +111,7 @@ RELEASE_DATE=$(date +%Y-%m-%d)
   if [ ${#CHANGED[@]} -gt 0 ]; then
     echo "### Changed"
     for entry in "${CHANGED[@]}"; do
-      IFS='|' read -r HASH MSG AUTHOR DATE <<< "$entry"
+      IFS='|' read -r MSG AUTHOR DATE <<< "$entry"
       echo "- **$AUTHOR**: $MSG"
     done
     echo ""
@@ -108,7 +120,7 @@ RELEASE_DATE=$(date +%Y-%m-%d)
   if [ ${#REMOVED[@]} -gt 0 ]; then
     echo "### Removed"
     for entry in "${REMOVED[@]}"; do
-      IFS='|' read -r HASH MSG AUTHOR DATE <<< "$entry"
+      IFS='|' read -r MSG AUTHOR DATE <<< "$entry"
       echo "- **$AUTHOR**: $MSG"
     done
     echo ""
@@ -117,7 +129,7 @@ RELEASE_DATE=$(date +%Y-%m-%d)
   if [ ${#OTHER[@]} -gt 0 ]; then
     echo "### Other"
     for entry in "${OTHER[@]}"; do
-      IFS='|' read -r HASH MSG AUTHOR DATE <<< "$entry"
+      IFS='|' read -r MSG AUTHOR DATE <<< "$entry"
       echo "- **$AUTHOR**: $MSG"
     done
     echo ""
