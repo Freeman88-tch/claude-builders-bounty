@@ -1,24 +1,20 @@
 #!/bin/bash
-# claude-review — Review a GitHub PR via CLI
+# claude-review — Review a GitHub PR via CLI (Zero API keys required!)
 # Usage: bash pr-review.sh --pr https://github.com/owner/repo/pull/123
 #        bash pr-review.sh --pr 123 --repo owner/repo
 
 set -euo pipefail
 
-# Parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pr) PR_REF="$2"; shift 2 ;;
     --repo) REPO="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
-    --api-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
     *) echo "Usage: $0 --pr <url|number> [--repo owner/repo] [--output file.md]"; exit 1 ;;
   esac
 done
 
-# Parse PR URL or number
 if echo "$PR_REF" | grep -qE '^https?://'; then
-  # Extract owner/repo/number from URL
   REPO=$(echo "$PR_REF" | sed -E 's|https?://github.com/||' | sed -E 's|/pull/[0-9]+.*||')
   PR_NUM=$(echo "$PR_REF" | sed -E 's|.*/pull/||' | sed -E 's|/.*||')
 elif echo "$PR_REF" | grep -qE '^[0-9]+$'; then
@@ -26,89 +22,86 @@ elif echo "$PR_REF" | grep -qE '^[0-9]+$'; then
 fi
 
 if [ -z "${REPO:-}" ] || [ -z "${PR_NUM:-}" ]; then
-  echo "❌ Could not determine repo or PR number"
   echo "Usage: $0 --pr https://github.com/owner/repo/pull/123"
   exit 1
 fi
 
 OUTPUT="${OUTPUT:-pr_review_${PR_NUM}.md}"
-GH_TOKEN="${GH_TOKEN:-}"
+echo "Reviewing PR #$PR_NUM on $REPO"
 
-echo "🔍 Reviewing PR #$PR_NUM on $REPO"
+# Fetch PR data (no token needed for public repos)
+PR_DATA=$(curl -s "https://api.github.com/repos/$REPO/pulls/$PR_NUM")
+PR_DIFF=$(curl -s -H "Accept: application/vnd.github.v3.diff" \
+  "https://api.github.com/repos/$REPO/pulls/$PR_NUM")
 
-# Fetch PR details via GitHub API
-if [ -z "$GH_TOKEN" ]; then
-  # Unauthenticated — limited to public repos
-  PR_DATA=$(curl -s "https://api.github.com/repos/$REPO/pulls/$PR_NUM")
-  PR_DIFF=$(curl -s "https://api.github.com/repos/$REPO/pulls/$PR_NUM" \
-    -H "Accept: application/vnd.github.v3.diff")
-else
-  PR_DATA=$(curl -s -H "Authorization: token $GH_TOKEN" \
-    "https://api.github.com/repos/$REPO/pulls/$PR_NUM")
-  PR_DIFF=$(curl -s -H "Authorization: token $GH_TOKEN" \
-    -H "Accept: application/vnd.github.v3.diff" \
-    "https://api.github.com/repos/$REPO/pulls/$PR_NUM")
+PR_TITLE=$(echo "$PR_DATA" | grep '"title"' | head -1 | sed 's/.*"title": "\(.*\)",/\1/')
+PR_BODY=$(echo "$PR_DATA" | grep '"body"' | head -1 | sed 's/.*"body": "\(.*\)",/\1/')
+CHANGED=$(echo "$PR_DATA" | grep '"changed_files"' | sed 's/.*: //;s/,//')
+ADDITIONS=$(echo "$PR_DATA" | grep '"additions"' | sed 's/.*: //;s/,//')
+DELETIONS=$(echo "$PR_DATA" | grep '"deletions"' | sed 's/.*: //;s/,//')
+
+echo "PR: $PR_TITLE"
+echo "Files: $CHANGED | +$ADDITIONS/-$DELETIONS"
+
+# Heuristic analysis (works without any API key)
+LINES=$(echo "$PR_DIFF" | wc -l)
+FILES_CHANGED=$(echo "$PR_DIFF" | grep '^diff --git' | wc -l)
+NEW_FILES=$(echo "$PR_DIFF" | grep '^new file' | wc -l)
+DEL_FILES=$(echo "$PR_DIFF" | grep '^deleted file' | wc -l)
+COMMENTS_IN_CODE=$(echo "$PR_DIFF" | grep -c '^+.*//\|^+.*#\|^+.*<!--\|^+.*/\\*' || true)
+TEST_CHANGES=$(echo "$PR_DIFF" | grep -c 'test\|spec\|__test__' || true)
+SECURITY_KEYWORDS=$(echo "$PR_DIFF" | grep -ci 'password\|token\|secret\|key\|api_key\|credential' || true)
+CONSOLE_LOGS=$(echo "$PR_DIFF" | grep -c 'console.log\|console.error\|print(' || true)
+
+# Generate risks
+RISKS=""
+if [ "$SECURITY_KEYWORDS" -gt 0 ]; then RISKS="$RISKS\n- Security: Potential credential exposure detected"; fi
+if [ "$CONSOLE_LOGS" -gt 0 ]; then RISKS="$RISKS\n- Debug: Console.log/print statements left in code"; fi
+if [ "$LINES" -gt 500 ]; then RISKS="$RISKS\n- Size: Large diff ($LINES lines) — harder to review thoroughly"; fi
+if [ "$NEW_FILES" -gt 5 ]; then RISKS="$RISKS\n- Scope: $NEW_FILES new files added — check for unnecessary additions"; fi
+if [ -z "$RISKS" ]; then RISKS="No significant risks detected."; fi
+
+# Generate suggestions
+SUGGESTIONS=""
+if [ "$COMMENTS_IN_CODE" -lt 3 ] && [ "$LINES" -gt 100 ]; then
+  SUGGESTIONS="$SUGGESTIONS\n- Add inline comments for complex logic"
+fi
+if [ "$TEST_CHANGES" -eq 0 ] && [ "$LINES" -gt 50 ]; then
+  SUGGESTIONS="$SUGGESTIONS\n- Include test coverage for new/changed functionality"
+fi
+SUGGESTIONS="$SUGGESTIONS\n- Consider adding a brief summary in the PR description if missing"
+
+# Confidence score
+if [ "$LINES" -lt 100 ]; then SCORE="High — Small, focused change"
+elif [ "$LINES" -lt 500 ]; then SCORE="Medium — Moderate size, manual spot-check recommended"
+else SCORE="Low — Large diff, thorough manual review recommended"
 fi
 
-# Extract metadata
-PR_TITLE=$(echo "$PR_DATA" | python3 -c "import sys,json;print(json.load(sys.stdin).get('title',''))" 2>/dev/null || echo "Unknown")
-PR_BODY=$(echo "$PR_DATA" | python3 -c "import sys,json;print(json.load(sys.stdin).get('body','') or '')" 2>/dev/null || echo "")
-CHANGED_FILES=$(echo "$PR_DATA" | python3 -c "import sys,json;print(json.load(sys.stdin).get('changed_files',''))" 2>/dev/null || echo "?")
-ADDITIONS=$(echo "$PR_DATA" | python3 -c "import sys,json;print(json.load(sys.stdin).get('additions',''))" 2>/dev/null || echo "?")
-DELETIONS=$(echo "$PR_DATA" | python3 -c "import sys,json;print(json.load(sys.stdin).get('deletions',''))" 2>/dev/null || echo "?")
-
-echo "📋 $PR_TITLE"
-echo "   Files: $CHANGED_FILES | +$ADDITIONS/-$DELETIONS"
-
-# Use Claude API or fallback to local heuristic analysis
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  echo "🤖 Analyzing with Claude..."
-  
-  REVIEW=$(curl -s -X POST https://api.anthropic.com/v1/messages \
-    -H "x-api-key: $ANTHROPIC_API_KEY" \
-    -H "anthropic-version: 2023-06-01" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"model\": \"claude-sonnet-4-20250514\",
-      \"max_tokens\": 2048,
-      \"system\": \"You are a senior code reviewer. Analyze the PR diff and produce a structured review.\",
-      \"messages\": [{
-        \"role\": \"user\",
-        \"content\": \"Review this PR:\\n\\nTitle: $PR_TITLE\\nDescription: $PR_BODY\\nFiles: $CHANGED_FILES, +$ADDITIONS/-$DELETIONS\\n\\nDiff:\\n\`\`\`\\n${PR_DIFF:0:8000}\\n\`\`\`\\n\\nProduce a structured review with:\\n1. Summary (2-3 sentences)\\n2. Identified Risks (list)\\n3. Improvement Suggestions (list)\\n4. Confidence Score: Low/Medium/High\"
-      }]
-    }")
-    
-  REVIEW_TEXT=$(echo "$REVIEW" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-content = data.get('content', [{}])
-text = content[0].get('text', 'Review unavailable') if isinstance(content, list) else str(content)
-print(text)
-" 2>/dev/null || echo "⚠️ Claude API review failed")
-else
-  # Fallback: heuristic analysis without Claude
-  echo "⚠️ No Claude API key — using heuristic analysis"
-  REVIEW_TEXT="## Summary\nAutomated heuristic review of PR #$PR_NUM\n\n## Changes Overview\n- $CHANGED_FILES files changed (+$ADDITIONS/-$DELETIONS)\n\n## Identified Risks\n- ⚠️ Large diff size — review carefully\n- Manual review recommended for production-critical changes\n\n## Improvement Suggestions\n- Add inline comments for complex logic\n- Ensure test coverage for new features\n\n## Confidence Score\nLow — Human review recommended (no AI analysis configured)"
-fi
-
-# Write output
-cat > "$OUTPUT" << EOF
+cat > "$OUTPUT" << REVIEWEOF
 # PR Review: #$PR_NUM — $PR_TITLE
 
 **Repository:** $REPO  
-**Files Changed:** $CHANGED_FILES  
-**Additions/Deletions:** +$ADDITIONS/-$DELETIONS  
+**Files Changed:** $CHANGED (+$ADDITIONS/-$DELETIONS)  
+**Analysis Method:** Static heuristic analysis (no API keys required)  
 
 ---
 
-$REVIEW_TEXT
+## Summary
+$([[ -n "$PR_BODY" ]] && echo "$PR_BODY" || echo "This PR modifies $FILES_CHANGED file(s) across $CHANGED changed files.")
+
+## Identified Risks
+$RISKS
+
+## Improvement Suggestions
+$SUGGESTIONS
+
+## Confidence Score
+$SCORE
 
 ---
 
-_Generated by [claude-review](https://github.com/Freeman88-tch) on $(date +%Y-%m-%d)_
-EOF
+_Generated by [claude-review](https://github.com/Freeman88-tch) on $(date +%Y-%m-%d) — Zero API keys required_
+REVIEWEOF
 
-echo "✅ Review saved to: $OUTPUT"
-echo ""
-echo "📄 Output preview:"
-head -20 "$OUTPUT"
+echo "Review saved: $OUTPUT"
+head -5 "$OUTPUT"
